@@ -5,14 +5,18 @@
       args:
         chdir: ~/devops-lab-aws/terraform
 
-    - name: Destroy Terraform configuration
+    - name: Check if Terraform state exists
+      ansible.builtin.stat:
+        path: ~/devops-lab-aws/terraform/terraform.tfstate
+      register: tfstate
+
+    - name: Destroy Terraform config (only if state exists)
       command: terraform destroy --auto-approve
       args:
         chdir: ~/devops-lab-aws/terraform
-      register: terraform
-                
+      when: tfstate.stat.exists    
+            
     - name: Apply Terraform configuration
-      tags: apply
       command: terraform apply --auto-approve
       args:
         chdir: ~/devops-lab-aws/terraform
