@@ -1,2 +1,2 @@
 # devops-lab-aws
- The project installs several packages, including Terraform, Ansible, Puppet, and Docker, on a dynamically created AWS VM.
+ Terraform and Ansible-based automated deployment of a full DevOps lab environment in AWS EC2, including Puppet Master/Agent, Docker, and supporting tools.”

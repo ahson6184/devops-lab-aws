@@ -1,0 +1,231 @@
+- hosts: localhost
+  tasks: 
+    - name: Initialize Terraform
+      command: terraform init
+      args:
+        chdir: ~/devops-lab-aws/terraform
+
+    - name: Destroy Terraform configuration
+      command: terraform destroy --auto-approve
+      args:
+        chdir: ~/devops-lab-aws/terraform
+      register: terraform
+                
+    - name: Apply Terraform configuration
+      tags: apply
+      command: terraform apply --auto-approve
+      args:
+        chdir: ~/devops-lab-aws/terraform
+      register: terraform
+
+    - name: Get instace IP address
+      shell: "terraform output -raw instance_ip_address"
+      args: 
+        chdir: ~/devops-lab-aws/terraform
+      register: ipv4_address 
+
+    - name: Add host to dynamic group
+      ansible.builtin.add_host:
+        name: "{{ ipv4_address.stdout }}"
+        groups: dynamic_group
+
+    - name: Fail if no instance IP is found
+      fail:
+        msg: "Instance IP address is empty. Terraform output may have failed"
+      when: ipv4_address.stdout == ""
+        
+    - name: Wait for SSH to become available
+      wait_for:
+        host: '{{ ipv4_address.stdout }}'
+        port: 22
+        delay: 10
+        timeout: 120
+    - name: Wait for system to be fully booted and ready for SSH
+      wait_for:
+        path: /var/run/nologin
+        state: absent
+        delay: 10
+        timeout: 600
+          
+- hosts: dynamic_group
+  remote_user: ubuntu 
+  vars:
+    ansible_ssh_common_args: ' -o StrictHostKeyChecking=no'
+  become: true
+  tasks:
+    
+    - name: Download HashiCorp GPG key
+      ansible.builtin.get_url:
+        url: https://apt.releases.hashicorp.com/gpg
+        dest: /tmp/hashicorp.gpg
+        mode: '0644'
+
+    - name: Ensure keyring directory exists
+      ansible.builtin.file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+
+    - name: Add HashiCorp GPG key to keyring
+      ansible.builtin.command: gpg --dearmor -o /etc/apt/keyrings/hashicorp-archive-keyring.gpg /tmp/hashicorp.gpg
+      args:
+        creates: /etc/apt/keyrings/hashicorp-archive-keyring.gpg
+
+    - name: Add HashiCorp repository
+      ansible.builtin.apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com {{ ansible_distribution_release }} main"
+        filename: hashicorp
+        update_cache: no  # We'll update manually after
+
+    - name: Update apt cache
+      apt:
+        update_cache : true
+    
+    - name: Install ansible and terraform
+      ansible.builtin.apt:
+        pkg:
+          - ansible
+          - python3-dev
+          - python3-pip
+          - terraform
+        state: latest
+
+    - name: Touch ansible.cfg in home folder 
+      ansible.builtin.file:
+        path: /home/ubuntu/.ansible.cfg
+        state: touch
+
+    - name: Touch ansible.log in /var/log folder 
+      ansible.builtin.file:
+        path: /var/log/ansible.log
+        state: touch
+        mode: '0666'
+      become: true
+
+    - name: Set inventory configuration in ansible.cfg
+      ansible.builtin.blockinfile:
+        path: /home/ubuntu/.ansible.cfg
+        block: |
+          [defaults]
+          # The default inventory file location
+          inventory = /home/ubuntu/.ansible/hosts
+          # Where to store the logs
+          log_path = /var/log/ansible.log
+          # The default module path for ansible modules
+          library = /etc/apt/ansible/plugins/modules
+          # Whether or not to check the syntax of the playbooks
+          syntax_check = True
+          # Default SSH timeout
+          timeout = 30
+          # The default user to use for SSH
+          #remote_user = ubuntu
+          # Disable host key checking (useful for dynamic environments)
+          host_key_checking = False
+          # Enable fact gathering
+          gathering = smart
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+
+    - name: Copy credentials to new vm
+      ansible.builtin.copy:
+        src: ~/.aws
+        dest: /home/ubuntu/
+        owner: ubuntu
+        group: ubuntu
+      ignore_errors: true
+        
+    
+    - name: Download Puppet binary
+      ansible.builtin.get_url:
+        url: https://apt.puppet.com/puppet8-release-jammy.deb
+        dest: /tmp/puppet8-release-jammy.deb
+
+    - name: Install puppet8-release-jammy.deb
+      ansible.builtin.apt:
+        deb: /tmp/puppet8-release-jammy.deb
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: true
+
+    - name: Install puppet server and agent
+      ansible.builtin.apt:
+        pkg:
+          - puppetserver
+          - puppet-agent
+          - augeas-tools
+        state: present
+
+    - name: Create symlink to apply puppet directly 
+      ansible.builtin.file:
+        src:  /opt/puppetlabs/bin/puppet
+        dest: /usr/local/bin/puppet
+        state: link
+      ignore_errors: true
+
+
+    - name: Add puppetmaster to /etc/hosts
+      ansible.builtin.lineinfile:
+        path: /etc/hosts
+        line: "{{ ansible_default_ipv4.address }}  puppetmaster.aws puppetmaster"
+      when: ansible_default_ipv4.address is defined
+      ignore_errors: true
+
+    - name: Set puppetmaster configuration in puppet.conf
+      ansible.builtin.blockinfile:
+        path: /etc/puppetlabs/puppet/puppet.conf
+        block: |
+          [main]
+          certname = puppetmaster.aws
+          server = puppetmaster.aws
+          environment = production
+          runinterval = 30m
+        marker: "# {mark} ANSIBLE MANAGED BLOCK"
+
+    - name: Add puppetmaster dns to /etc/puppetlabs/puppet/puppet.conf
+      ansible.builtin.lineinfile:
+        path: /etc/puppetlabs/puppet/puppet.conf
+        line: dns_alt_names=puppetmaster.aws,puppetmaster
+
+    - name: Setting up ca server in puppet master
+      ansible.builtin.shell:
+        cmd: /opt/puppetlabs/bin/puppetserver ca setup
+
+    - name: Ensure puppet-server is running
+      ansible.builtin.service:
+        name: puppetserver
+        state: started
+
+    - name: Wait for Puppet service to settle
+      ansible.builtin.pause:
+        seconds: 5
+
+    - name: Ensure puppet-agent is running
+      ansible.builtin.service:
+        name: puppet
+        state: started
+
+    - name: Install awscli with pip --user
+      ansible.builtin.pip:
+        name: awscli
+        extra_args: --user
+      become: false  # Important: Run as regular user, not root    
+
+    - name: Set environment variable in the .bashrc file
+      ansible.builtin.lineinfile:
+        path: ~/.bashrc
+        line: export PATH=$PATH:~/.local/bin
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+        
+    - name: Set a hostname
+      ansible.builtin.hostname:
+        name: dev
+
+    - name: Install docker
+      ansible.builtin.include_tasks:
+        file: tasks/docker.yaml
+
+
+
+

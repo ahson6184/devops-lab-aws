@@ -1,0 +1,11 @@
+# Ignore Terraform state and cache files
+terraform/.terraform/
+*.tfstate
+*.tfstate.backup
+.terraform.lock.hcl
+
+# General system/editor files
+*.log
+*.retry
+*.swp
+
